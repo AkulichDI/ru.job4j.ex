@@ -1,31 +1,417 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
+/* ═════════════════════════════════════════════════════════════════════════════════════
+ * ФИНАЛЬНЫЙ КОД v6.0++ (быстро, безопасно, без спама в логах)
+ * - Логика поиска сотрудника и подразделения (parent) — как в v6.0 (НЕ меняли).
+ * - Два массива задач: "разрешен" → закрыть, прочие открытые → переназначить на подразделение.
+ * - Снятие лицензии (→ notLicensed), архивирование через removed = true.
+ * - Строгий таймаут 4 минуты.
+ * - Возврат компактного отчёта (не превышает 50k).
+ * - Логи: только КОРОТКАЯ СВОДКА с тегом [info][архивирование], с ограничением строк.
+ * ═════════════════════════════════════════════════════════════════════════════════════ */
 
-    <groupId>org.example</groupId>
-    <artifactId>ru.job4j.ex</artifactId>
-    <version>1.0-SNAPSHOT</version>
+/* ═════ ВСТАВЬТЕ СВОЙ БОЛЬШОЙ СПИСОК/CSV С ФИО ═════ */
+def CSV_TEXT = $/
+Иванов Иван Иванович
+Петров Пётр Петрович
+/$
 
-    <properties>
-        <maven.compiler.source>24</maven.compiler.source>
-        <maven.compiler.target>24</maven.compiler.target>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    </properties>
-    <dependencies>
-        <dependency>
-            <groupId>org.assertj</groupId>
-            <artifactId>assertj-core</artifactId>
-            <version>1.5.0</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter</artifactId>
-            <version>RELEASE</version>
-            <scope>test</scope>
-        </dependency>
-    </dependencies>
+/* ═════ КОНФИГУРАЦИЯ ═════ */
+def DRY_RUN = false                           // ⚠️ Для теста поставьте true
+long MAX_PROCESSING_TIME_MS = 240000          // ⏱️ Ровно 4 минуты
+int  MAX_EDITS_PER_EMPLOYEE = 1000            // Предохранитель «на сотрудника»
+int  MAX_TOTAL_EDITS = 50000                  // Глобальный предохранитель
+char DELIM = ','                              // Разделитель CSV
+int  FIO_COL = 0                              // Индекс колонки с ФИО
 
-</project>
+// Классы и атрибуты связей (как в v6)
+List<String> CLASSES = ['serviceCall', 'task']
+List<String> REL_ATTRS = [
+  'responsibleEmployee','executor','assignee','author',
+  'clientEmployee','initiator','manager','observer'
+]
+
+// Поля для назначения подразделения (как в v6)
+List<String> OU_TARGET_FIELDS = ['responsibleOu','ou']
+
+// Множества статусов (лексика как в v6)
+Set<String> CLOSE_STATUS_CODES  = ['resolved','разрешен','разрешено','разрешён'] as Set
+Set<String> CLOSED_STATUS_CODES = ['closed','закрыт','закрыто'] as Set
+Set<String> SKIP_STATUS_CODES = (CLOSE_STATUS_CODES + CLOSED_STATUS_CODES + [
+  'canceled','cancelled','done','completed','finished','archived'
+]) as Set
+Set<String> SKIP_STATUS_TITLES = [
+  'разрешен','разрешено','разрешён','закрыт','закрыто',
+  'отклонен','отклонено','отклонён','выполнен','выполнено',
+  'решено','решён','завершен','завершено','завершён',
+  'отменен','отменено','отменён','архив'
+] as Set
+
+/* ═════ ЛОГ-СВОДКА: INFO с тегом [архивирование], без спама ═════
+ * Печатаем ТОЛЬКО сводку и ограниченное число строк/ФИО в логах.
+ * Никаких logger.* — только println с префиксом для фильтрации.
+ */
+boolean LOG_SUMMARY_TO_CONSOLE   = true
+String  LOG_SUMMARY_TAG          = "[info][архивирование]"
+int     LOG_SUMMARY_MAX_LINES    = 20     // глобальный бюджет строк логов (включая заголовки)
+int     LOG_SUMMARY_CHUNK_NAMES  = 25     // ФИО в одной строке (для читаемости)
+boolean LOG_SORT_NAMES           = true   // сортировать ФИО в логах
+
+/* Глушилка platform logger (на случай косвенных вызовов) */
+def logger = [ info:{Object..._->{ }}, warn:{Object..._->{ }}, error:{Object..._->{ }}, debug:{Object..._->{ }} ]
+def log = logger
+
+/* ═════ КОМПАКТНЫЙ И БЕЗОПАСНЫЙ ОТЧЁТ (return) ═════ */
+int REPORT_SOFT_LIMIT     = 48000     // запас к лимиту 50k persistent context
+int REPORT_LIST_MAX_ITEMS = 50        // в return показываем не более 50 имён на список
+int REPORT_LIST_CHUNK     = 25        // имён на строку в return
+
+def report = new StringBuilder(4096)
+def appendLine = { String s ->
+  if (report.length() + s.length() + 1 <= REPORT_SOFT_LIMIT) {
+    report.append(s).append('\n')
+  } else if (!report.toString().endsWith("… [вывод обрезан]\n")) {
+    report.append("… [вывод обрезан]\n")
+  }
+}
+def emitList = { String label, List<String> items ->
+  int count = items?.size() ?: 0
+  appendLine("${label}: ${count}")
+  if (!items || count == 0) return
+  def sorted = LOG_SORT_NAMES ? new ArrayList(items).sort() : items
+  int n = Math.min(count, REPORT_LIST_MAX_ITEMS)
+  for (int i = 0; i < n; i += REPORT_LIST_CHUNK) {
+    int j = Math.min(n, i + REPORT_LIST_CHUNK)
+    appendLine("  " + sorted.subList(i, j).join(', '))
+  }
+  if (count > n) appendLine("  ... и ещё ${count - n}")
+}
+def emitKV = { String key, Object val ->
+  appendLine(String.format("%-36s %s", key + ":", String.valueOf(val)))
+}
+
+/* ═════ ВРЕМЯ/ТРАНЗАКЦИИ ═════ */
+def startTime = System.currentTimeMillis()
+def checkTimeout = { -> (System.currentTimeMillis() - startTime) >= MAX_PROCESSING_TIME_MS }
+
+def inTx = { Closure c ->
+  try {
+    if (this.metaClass.hasProperty(this,'api') && api?.tx) return api.tx.call { c.call() }
+    return c.call()
+  } catch (ignored) { return null }
+}
+
+/* ═════ ИЗВЛЕЧЕНИЕ ФИО ИЗ БОЛЬШОГО ТЕКСТА/CSV (как в v6) ═════ */
+def splitCsv = { String line ->
+  def res = []; def cur = new StringBuilder(); boolean inQuotes = false
+  for (int i=0;i<line.length();i++){
+    char ch=line.charAt(i)
+    if (ch=='"'){
+      if (inQuotes && i+1<line.length() && line.charAt(i+1)=='"'){ cur.append('"'); i++ }
+      else { inQuotes = !inQuotes }
+    } else if (ch==DELIM && !inQuotes){
+      res.add(cur.toString().trim()); cur.setLength(0)
+    } else { cur.append(ch) }
+  }
+  res.add(cur.toString().trim()); return res
+}
+def buildFioList = { String csvText ->
+  def fioList = [] as List<String>
+  csvText.readLines().each { line ->
+    def trimmed = line?.trim()
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) return
+    try {
+      def cols = splitCsv(line)
+      def fioCell = cols.size()>FIO_COL ? cols[FIO_COL] : ''
+      def normalized = fioCell?.replace('\u00A0',' ')?.replaceAll(/\s+/, ' ')?.trim()
+      if (!normalized) return
+      def words = normalized.tokenize(' ')
+      if (words.size()<2) return
+      def fio = words.take(3).join(' ')
+      if (!fioList.contains(fio)) fioList.add(fio)
+    } catch (ignored){}
+  }
+  return fioList
+}
+
+/* ═════ ПОИСК СОТРУДНИКА ПО ФИО (как в v6, не меняем) ═════ */
+def normalizeFio = { String s ->
+  (s ?: '').replace('\u00A0',' ').replaceAll(/\s+/, ' ')
+           .replace('ё','е').replace('Ё','Е').trim()
+}
+def toObj = { any -> try { (any instanceof String) ? utils.get(any) : any } catch (ignored){ any } }
+def findEmployeeByFio = { String fioInput ->
+  try {
+    def fio = normalizeFio(fioInput); if (!fio) return null
+    try { def f=utils.find('employee',[title:fio], sp.ignoreCase()); if (f?.size()==1) return toObj(f[0]) } catch(ignored){}
+    try { def f=utils.find('employee',[title:op.like("%${fio}%")], sp.ignoreCase()); if (f?.size()==1) return toObj(f[0]) } catch(ignored){}
+    def parts = fio.tokenize(' ')
+    if (parts.size()>=2){
+      try { def f=utils.find('employee',[lastName:parts[0], firstName:parts[1]], sp.ignoreCase()); if (f?.size()==1) return toObj(f[0]) } catch(ignored){}
+    }
+    return null
+  } catch (e){ return null }
+}
+
+/* ═════ СТАТУС ОБЪЕКТА ═════ */
+def getStatusInfo = { obj ->
+  try {
+    if (!obj) return ['', '']
+    def code=''; def title=''
+    ['status','state','stage'].each { field ->
+      try {
+        def st = obj."${field}"
+        if (st){
+          if (!code)  code  = st.code ?.toString()?.toLowerCase() ?: ''
+          if (!title) title = st.title?.toString()?.toLowerCase() ?: ''
+        }
+      } catch (ignored){}
+    }
+    return [code,title]
+  } catch (e){ return ['', ''] }
+}
+
+/* ═════ ПОДРАЗДЕЛЕНИЕ СОТРУДНИКА (parent → ou$ID) — как в v6 ═════ */
+def getEmployeeDepartment = { emp ->
+  try {
+    if (!emp) return null
+    def parent = emp.parent; if (!parent) return null
+    def uuid = parent?.UUID; if (!uuid) return null
+    def normalizedUuid = uuid.toString()
+    if (!normalizedUuid.contains('$')) normalizedUuid = "ou\$${uuid}"
+    return normalizedUuid
+  } catch (e){ return null }
+}
+
+/* ═════ ПРОВЕРКА/НАЗНАЧЕНИЕ ПОДРАЗДЕЛЕНИЯ ═════ */
+def alreadyAssignedTo = { obj, String field, String targetUuid ->
+  try {
+    def value = obj."${field}"; if (!value) return false
+    def currentUuid = value?.UUID?.toString() ?: (value instanceof String ? value : null)
+    if (!currentUuid) return false
+    if (currentUuid == targetUuid) return true
+    def extractId = { u -> u.contains('$') ? u.split('\\$',2)[1] : u }
+    return extractId(currentUuid) == extractId(targetUuid)
+  } catch (e){ return false }
+}
+def tryAssign = { obj, List fields, String targetUuid ->
+  for (String field : fields) {
+    try {
+      if (alreadyAssignedTo(obj, field, targetUuid)) return 'already'
+      if (DRY_RUN) return 'assigned'
+      inTx { utils.edit(obj, [(field): targetUuid]) }
+      return 'assigned'
+    } catch (ignored){}
+  }
+  return 'failed'
+}
+
+/* ═════ ЗАКРЫТИЕ "РАЗРЕШЕННЫХ" (алгоритм из v6) ═════ */
+def tryCloseResolvedTask = { obj ->
+  try {
+    def (code,title) = getStatusInfo(obj)
+    boolean isResolved = CLOSE_STATUS_CODES.contains(code) ||
+                         title.contains('разрешен') || title.contains('разрешё')
+    if (!isResolved) return false
+    if (DRY_RUN) return true
+    try { inTx { utils.edit(obj, [status:[code:'closed']]) }; return true } catch (ignored){}
+    try { inTx { utils.edit(obj, [state: 'closed']) };      return true } catch (ignored){}
+    return false
+  } catch (e){ return false }
+}
+
+/* ═════ ИЗ v6: ПОИСК ЗАДАЧ ДЛЯ ЗАКРЫТИЯ (узкий) ═════ */
+def findTasksToClose = { emp ->
+  def tasks = []; def seen = new HashSet()
+  try {
+    CLASSES.each { cls ->
+      ['responsibleEmployee','initiator'].each { attr ->
+        if (checkTimeout()) return tasks
+        try {
+          def list = utils.find(cls, [(attr): emp])
+          list?.each { o -> if (o?.UUID && seen.add(o.UUID)) tasks.add(o) }
+        } catch (ignored){}
+      }
+    }
+  } catch (ignored){}
+  return tasks
+}
+
+/* ═════ ИЗ v6: ПОИСК ВСЕХ СВЯЗАННЫХ ДЛЯ ПЕРЕНАЗНАЧЕНИЯ ═════ */
+def findAllRelatedObjects = { emp ->
+  def related = []; def seen = new HashSet()
+  CLASSES.each { cls ->
+    REL_ATTRS.each { attr ->
+      if (checkTimeout()) return related
+      try {
+        def list = utils.find(cls, [(attr): emp])
+        list?.each { o -> if (o?.UUID && seen.add(o.UUID)) related.add(o) }
+      } catch (ignored){}
+    }
+  }
+  return related
+}
+
+/* ═════ СМЕНА ЛИЦЕНЗИИ (→ notLicensed) ═════ */
+def updateLicense = { emp ->
+  try {
+    def cur = emp?.license
+    boolean alreadyNot = false
+    if (cur instanceof String) {
+      def s = cur.toLowerCase(); alreadyNot = s.contains('notlicensed') || s.contains('нелиценз')
+    } else if (cur?.code) {
+      alreadyNot = cur.code.toString().toLowerCase().contains('notlicensed')
+    } else if (cur?.title) {
+      def t = cur.title.toString().toLowerCase(); alreadyNot = t.contains('notlicensed') || t.contains('нелиценз')
+    }
+    if (alreadyNot) return [false,true]
+    if (DRY_RUN) return [true,false]
+    inTx { utils.edit(emp, [license: 'notLicensed']) }
+    return [true,false]
+  } catch (e){ return [false,false] }
+}
+
+/* ═════ АРХИВ (removed = true) ═════ */
+def archiveEmployee = { emp ->
+  try {
+    if (emp?.removed == true) return true
+    if (DRY_RUN) return true
+    inTx { utils.edit(emp, [removed: true]) }
+    return true
+  } catch (e){ return false }
+}
+
+/* ═════ ОСНОВНОЙ ЦИКЛ ═════ */
+def fioList = buildFioList(CSV_TEXT)
+if (!fioList || fioList.isEmpty()) {
+  appendLine("CSV/текст пуст — нет ФИО для обработки.")
+  return report.toString()
+}
+
+// Сводные счётчики
+int processedEmployees = 0
+int tasksClosedTotal = 0
+int tasksReassignedTotal = 0
+int licensesChanged = 0
+int licensesAlreadyNot = 0
+int archivedOk = 0
+int totalEdits = 0
+
+// Отчётные списки по проблемам
+def notFoundEmployees = [] as List<String>
+def noDepartmentEmployees = [] as List<String>
+def licenseFailed = [] as List<String>
+def archiveFailed = [] as List<String>
+def timedOutNotProcessed = [] as List<String>
+
+for (int i=0; i<fioList.size(); i++) {
+  if (checkTimeout()) { timedOutNotProcessed.addAll(fioList.subList(i, fioList.size())); break }
+
+  def fio = fioList[i]
+  def emp = findEmployeeByFio(fio)
+  if (!emp) { notFoundEmployees << fio; continue }
+
+  def departmentUuid = getEmployeeDepartment(emp)
+  if (!departmentUuid) { noDepartmentEmployees << fio; continue }
+
+  // === 1) МАССИВ #1: "разрешен" — ЗАКРЫВАЕМ ===
+  def toClose = findTasksToClose(emp) ?: []
+  int closedForEmp = 0
+  for (obj in toClose) {
+    if (checkTimeout()) { timedOutNotProcessed.addAll(fioList.subList(i+1, fioList.size())); break }
+    if (totalEdits >= MAX_TOTAL_EDITS) break
+    def (code,title) = getStatusInfo(obj)
+    boolean isResolved = CLOSE_STATUS_CODES.contains(code) || title.contains('разрешен') || title.contains('разрешё')
+    if (!isResolved) continue
+    if (tryCloseResolvedTask(obj)) {
+      closedForEmp++; tasksClosedTotal++; totalEdits++
+      if (closedForEmp >= MAX_EDITS_PER_EMPLOYEE) break
+    }
+  }
+
+  // === 2) МАССИВ #2: прочие открытые — ПЕРЕНАЗНАЧАЕМ ===
+  def related = findAllRelatedObjects(emp) ?: []
+  int reassignedForEmp = 0
+  for (obj in related) {
+    if (checkTimeout()) { timedOutNotProcessed.addAll(fioList.subList(i+1, fioList.size())); break }
+    if (totalEdits >= MAX_TOTAL_EDITS) break
+    def (code,title) = getStatusInfo(obj)
+    if (SKIP_STATUS_CODES.contains(code) || SKIP_STATUS_TITLES.any { title.contains(it) }) continue
+    def res = tryAssign(obj, OU_TARGET_FIELDS, departmentUuid)
+    if (res == 'assigned') {
+      reassignedForEmp++; tasksReassignedTotal++; totalEdits++
+      if (reassignedForEmp >= MAX_EDITS_PER_EMPLOYEE) break
+    }
+  }
+
+  // === 3) Снятие лицензии ===
+  def (changed, alreadyNot) = updateLicense(emp)
+  if (changed) licensesChanged++
+  if (alreadyNot) licensesAlreadyNot++
+  if (!changed && !alreadyNot) licenseFailed << fio
+
+  // === 4) Архивирование (removed=true) ===
+  def okArch = archiveEmployee(emp)
+  if (okArch) archivedOk++ else archiveFailed << fio
+
+  processedEmployees++
+
+  // Мягкая локальная очистка ссылок (без GC в цикле)
+  toClose?.clear(); related?.clear()
+  toClose = null; related = null; emp = null
+
+  if (checkTimeout()) { timedOutNotProcessed.addAll(fioList.subList(i+1, fioList.size())); break }
+}
+
+/* ═════ ИТОГОВЫЙ ОТЧЁТ (return) ═════ */
+appendLine("=== СВОДКА (DRY_RUN=${DRY_RUN ? 'ON' : 'OFF'}) ===")
+emitKV("Обработано сотрудников", "${processedEmployees} из ${fioList.size()}")
+emitKV("Закрыто задач (\"разрешен\" → \"закрыт\")", tasksClosedTotal)
+emitKV("Переназначено открытых задач", tasksReassignedTotal)
+emitKV("Лицензий снято (→ notLicensed)", "${licensesChanged} (уже были: ${licensesAlreadyNot})")
+emitKV("Архивировано (removed=true)", archivedOk)
+
+emitList("Не удалось снять лицензию",                    licenseFailed)
+emitList("Не архивированы (removed=true не выставлен)",  archiveFailed)
+emitList("Не найдены по ФИО",                            notFoundEmployees)
+emitList("Без подразделения (parent)",                   noDepartmentEmployees)
+emitList("Не обработаны из-за таймаута",                 timedOutNotProcessed)
+
+/* ═════ ЛОГ-СВОДКА В КОНСОЛЬ (ограничение строк и разбиение ФИО) ═════ */
+if (LOG_SUMMARY_TO_CONSOLE) {
+  int _lines = 0
+  def canLog = { -> _lines < LOG_SUMMARY_MAX_LINES }
+  def logLine = { String s -> if (canLog()) { println("${LOG_SUMMARY_TAG} " + s); _lines++ } }
+  def logList = { String label, List<String> xs ->
+    if (!canLog()) return
+    int cnt = xs?.size() ?: 0
+    logLine("${label}: ${cnt}")
+    if (!xs || cnt == 0 || !canLog()) return
+    def sorted = LOG_SORT_NAMES ? new ArrayList(xs).sort() : xs
+    for (int i = 0; i < sorted.size() && canLog(); i += LOG_SUMMARY_CHUNK_NAMES) {
+      int j = Math.min(sorted.size(), i + LOG_SUMMARY_CHUNK_NAMES)
+      logLine("  " + sorted.subList(i, j).join(', '))
+    }
+  }
+
+  // Главные счётчики — по одной строке
+  logLine("Обработано сотрудников: ${processedEmployees} из ${fioList?.size() ?: 0}")
+  logLine("Закрыто задач (разрешен → закрыт): ${tasksClosedTotal}")
+  logLine("Переназначено открытых задач: ${tasksReassignedTotal}")
+  logLine("Лицензий снято (→ notLicensed): ${licensesChanged} (уже были: ${licensesAlreadyNot})")
+  logLine("Архивировано (removed=true): ${archivedOk}")
+
+  // Полезные списки (ФИО), но с ограничением общего числа строк
+  if (licenseFailed && !licenseFailed.isEmpty())           logList("Не снята лицензия", licenseFailed)
+  if (archiveFailed && !archiveFailed.isEmpty())           logList("Не архивированы (removed=true не выставлен)", archiveFailed)
+  if (notFoundEmployees && !notFoundEmployees.isEmpty())   logList("Не найдены по ФИО", notFoundEmployees)
+  if (noDepartmentEmployees && !noDepartmentEmployees.isEmpty()) logList("Без подразделения (parent)", noDepartmentEmployees)
+  if (timedOutNotProcessed && !timedOutNotProcessed.isEmpty())   logList("Не обработаны по таймауту", timedOutNotProcessed)
+
+  if (!canLog()) println("${LOG_SUMMARY_TAG} … [сводка сокращена: превышен лимит строк ${LOG_SUMMARY_MAX_LINES}]")
+}
+
+/* ═════ Завершение и мягкая очистка ═════ */
+CSV_TEXT = null
+fioList?.clear()
+System.gc()
+
+return report.toString()
