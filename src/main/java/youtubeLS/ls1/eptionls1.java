@@ -11,24 +11,29 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * Класс для построчной отправки данных из Excel в Naumen Service Desk
+ * Построчная отправка данных из Excel в Naumen Service Desk
  * через REST-метод exec-post.
  *
- * Формат:
- *   - первая строка Excel — заголовок (имена полей),
- *   - каждая следующая непустая строка — один JSON-объект,
- *   - каждая строка отправляется отдельным POST-запросом.
+ * ВАЖНО:
+ *   - на стороне Naumen есть метод:
  *
- * На стороне Naumen строка JSON попадает в параметр "params" и
- * может разбира́ться так:
+ *        def migration(requestContent) {
+ *            def obj = new JsonSlurper().parseText(requestContent)
+ *            for (ob in obj) { ... }
+ *        }
  *
- *   def obj = new JsonSlurper().parseText(params)
+ *   - поэтому мы:
+ *       1) вызываем exec-post с params=requestContent,
+ *       2) отправляем JSON в теле запроса (raw body),
+ *       3) Content-Type = application/json; charset=UTF-8,
+ *       4) в requestContent кладём МАССИВ, даже если в нём один объект: [ { ... } ].
  */
 public class ExcelToNaumenUploader {
 
@@ -36,115 +41,97 @@ public class ExcelToNaumenUploader {
 
     /**
      * Путь к Excel-файлу (.xlsx).
-     * Важно: файл должен существовать и быть доступен для чтения.
      */
     private static final String EXCEL_FILE_PATH = "C:/data/equipment.xlsx";
 
     /**
-     * Базовый URL REST-метода exec-post БЕЗ параметров.
-     *
-     * Для Naumen SD это обычно что-то вроде:
-     *   http://<ip или имя>:8080/sd/services/rest/exec-post
-     *
-     * ВНИМАНИЕ: только http://, т.к. у тебя нет SSL-сертификата.
+     
      */
     private static final String NAUMEN_API_URL =
-            "http://172.16.3.107:8080/sd/services/rest/exec-post";
-
-    /**
-     * Ключ доступа к REST API Naumen.
-     *
-     * В проде его НЕ хардкодят в коде:
-     * - переменная окружения,
-     * - внешний конфиг и т.п.
-     * Здесь для простоты — как константа-заглушка.
-     */
+            "
+     
     private static final String ACCESS_KEY = "ВАШ_ACCESS_KEY";
 
-    /**
-     * Имя вызываемой функции на стороне Naumen.
-     * В твоём случае: modules.apiMigrationITop.migration
-     */
-    private static final String FUNCTION = "modules.apiMigrationITop.migration";
+
+    private static final String FUNCTION = "";
 
     /**
-     * Пауза между запросами (мс), чтобы не перегружать сервер.
-     * Можно увеличить, если сервер слабый.
+     * Пауза между запросами (мс), чтобы не класть сервер.
      */
     private static final long PAUSE_MS = 500L;
 
     /**
-     * Включить подробный вывод (JSON, ответы сервера).
-     * Для прод-среды можно выключить (false), чтобы не светить данные.
+     * Флаг подробного логирования.
+     * В бою можно выключить (false), чтобы не светить данные.
      */
     private static final boolean VERBOSE = true;
 
     /**
-     * Общий экземпляр Gson для сериализации объектов в JSON.
-     * disableHtmlEscaping — чтобы не превращать <>& в \uXXXX, но
-     * это не ломает JSON, только делает его более читаемым.
+     * Общий экземпляр Gson для сериализации JSON.
      */
     private static final Gson GSON = new GsonBuilder()
-            .disableHtmlEscaping()
+            .disableHtmlEscaping() // делаем JSON чуть читаемее, спецсимволы всё равно экранируются как положено
             .create();
 
     // ======================== MAIN ====================================
 
     public static void main(String[] args) {
-        List<String> jsonObjects;
+        List<Map<String, Object>> rows;
         try {
-            jsonObjects = readExcelFile(EXCEL_FILE_PATH);
+            rows = readExcelRows(EXCEL_FILE_PATH);
         } catch (IOException e) {
             System.err.println("Ошибка чтения Excel-файла: " + e.getMessage());
             e.printStackTrace();
             return;
         }
 
-        if (jsonObjects.isEmpty()) {
+        if (rows.isEmpty()) {
             System.out.println("Нет данных для отправки (все строки пустые или только заголовок).");
             return;
         }
 
-        System.out.println("Найдено строк к отправке: " + jsonObjects.size());
+        System.out.println("Найдено строк к отправке: " + rows.size());
 
-        for (int i = 0; i < jsonObjects.size(); i++) {
-            String json = jsonObjects.get(i);
+        for (int i = 0; i < rows.size(); i++) {
 
-            // в Excel: строка 0 — заголовок, значит первая строка с данными — №2
-            int excelRowNum = i + 2;
+            Map<String, Object> rowData = rows.get(i);
+            int excelRowNum = i + 2; // 1-я строка — заголовок, первая строка данных — №2
+
+            // ДЕЛАЕМ МАССИВ ИЗ ОДНОЙ СТРОКИ: [ { ... } ]
+            String jsonArray = GSON.toJson(Collections.singletonList(rowData));
 
             if (VERBOSE) {
                 System.out.println();
-                System.out.println("[" + (i + 1) + "/" + jsonObjects.size() + "] " +
+                System.out.println("[" + (i + 1) + "/" + rows.size() + "] " +
                         "Отправка строки Excel № " + excelRowNum);
-                System.out.println("JSON: " + json);
+                System.out.println("JSON (requestContent): " + jsonArray);
             }
 
             try {
-                // Собираем URL с параметрами accessKey и func
-                String urlStr = NAUMEN_API_URL
-                        + "?accessKey=" + URLEncoder.encode(ACCESS_KEY, StandardCharsets.UTF_8.toString())
-                        + "&func=" + URLEncoder.encode(FUNCTION, StandardCharsets.UTF_8.toString());
+                String urlStr = buildExecPostUrl();
 
                 if (VERBOSE) {
-                    // Специально НЕ печатаем токен в URL.
-                    System.out.println("URL (без параметров доступа): " + NAUMEN_API_URL);
+                    System.out.println("URL (без тела): " + urlStr);
                 }
 
-                String response = sendJsonRequest(urlStr, json);
-                System.out.println("Ответ сервера: " + response);
+                HttpResult result = postJsonBody(urlStr, jsonArray);
+                System.out.println("Ответ сервера: " + result);
+
+                // при 500 логируем отдельно, чтобы можно было показать разработчикам Naumen
+                if (result.code == 500) {
+                    logFailedRow(excelRowNum, jsonArray, result.body);
+                }
 
             } catch (IOException e) {
                 System.err.println("Ошибка отправки для строки Excel № " + excelRowNum + ": " + e.getMessage());
                 e.printStackTrace();
             }
 
-            // Пауза между запросами, чтобы не забивать сервер
             try {
                 Thread.sleep(PAUSE_MS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                System.err.println("Поток прерван, останавливаемся.");
+                System.err.println("Поток прерван, остановка.");
                 break;
             }
         }
@@ -152,51 +139,66 @@ public class ExcelToNaumenUploader {
         System.out.println("Завершено.");
     }
 
+    // ===================== ПОСТРОЕНИЕ URL ==============================
+
+    /**
+     * Собираем URL вида:
+     *   http://.../exec-post?accessKey=...&func=...&params=requestContent
+     *
+     * Т.е. exec-post понимает, что requestContent надо взять из тела POST-запроса.
+     */
+    private static String buildExecPostUrl() throws UnsupportedEncodingException {
+        StringBuilder sb = new StringBuilder(NAUMEN_API_URL);
+        char join = NAUMEN_API_URL.contains("?") ? '&' : '?';
+
+        sb.append(join)
+          .append("accessKey=").append(URLEncoder.encode(ACCESS_KEY, StandardCharsets.UTF_8.toString()))
+          .append("&func=").append(URLEncoder.encode(FUNCTION, StandardCharsets.UTF_8.toString()))
+          .append("&params=").append(URLEncoder.encode("requestContent", StandardCharsets.UTF_8.toString()));
+
+        return sb.toString();
+    }
+
     // ===================== ЧТЕНИЕ EXCEL ================================
 
     /**
-     * Читает Excel-файл формата .xlsx.
-     * Первая строка (row 0) используется как заголовок (имена полей).
-     * Каждая следующая НЕпустая строка превращается в JSON-объект.
-     *
-     * @return список JSON-строк (по одной на каждую строку Excel с данными)
+     * Читает Excel (.xlsx) и возвращает список строк в виде Map "имя_столбца -> значение".
+     * Первая строка используется как заголовок (имена полей).
      */
-    private static List<String> readExcelFile(String filePath) throws IOException {
-        List<String> jsonList = new ArrayList<>();
+    private static List<Map<String, Object>> readExcelRows(String filePath) throws IOException {
+        List<Map<String, Object>> rows = new ArrayList<>();
 
         try (FileInputStream fis = new FileInputStream(filePath);
              Workbook workbook = new XSSFWorkbook(fis)) {
 
             Sheet sheet = workbook.getSheetAt(0);
             if (sheet == null) {
-                System.err.println("В книге нет ни одного листа.");
-                return jsonList;
+                System.err.println("В книге нет листов.");
+                return rows;
             }
 
             Row headerRow = sheet.getRow(0);
             if (headerRow == null) {
-                System.err.println("Отсутствует строка заголовка (row 0).");
-                return jsonList;
+                System.err.println("Нет строки с заголовком (row 0).");
+                return rows;
             }
 
             int numCols = headerRow.getLastCellNum();
             List<String> headers = new ArrayList<>(numCols);
 
-            // Заголовки колонок => имена полей JSON
+            // Заголовки колонок — имена полей
             for (int c = 0; c < numCols; c++) {
                 Cell cell = headerRow.getCell(c);
                 String name = (cell != null) ? cell.toString().trim() : ("Column" + (c + 1));
                 headers.add(name);
             }
 
-            // Обходим строки с индексом 1..lastRowNum
+            // Перебор строк с индексом 1..lastRowNum
             for (int r = 1; r <= sheet.getLastRowNum(); r++) {
                 Row row = sheet.getRow(r);
-                if (row == null) {
-                    continue;
-                }
+                if (row == null) continue;
 
-                // Проверяем, не полностью ли пустая строка
+                // пропускаем полностью пустые строки
                 boolean allEmpty = true;
                 for (int c = 0; c < numCols; c++) {
                     Cell cell = row.getCell(c);
@@ -207,9 +209,7 @@ public class ExcelToNaumenUploader {
                         break;
                     }
                 }
-                if (allEmpty) {
-                    continue;
-                }
+                if (allEmpty) continue;
 
                 Map<String, Object> rowData = new LinkedHashMap<>();
 
@@ -220,7 +220,6 @@ public class ExcelToNaumenUploader {
                     Object value;
 
                     if (cell == null || cell.getCellType() == CellType.BLANK) {
-                        // Пустая ячейка — пустая строка
                         value = "";
                     } else {
                         switch (cell.getCellType()) {
@@ -229,10 +228,8 @@ public class ExcelToNaumenUploader {
                                 break;
                             case NUMERIC:
                                 if (DateUtil.isCellDateFormatted(cell)) {
-                                    // Ячейка с датой — переводим в строку
                                     value = cell.getDateCellValue().toString();
                                 } else {
-                                    // Обычное число — double
                                     value = cell.getNumericCellValue();
                                 }
                                 break;
@@ -240,12 +237,9 @@ public class ExcelToNaumenUploader {
                                 value = cell.getBooleanCellValue();
                                 break;
                             case FORMULA:
-                                // Проще всего — формула как текст.
-                                // Если надо реально считать — использовать FormulaEvaluator.
                                 value = cell.getCellFormula();
                                 break;
                             default:
-                                // На всякий случай — строковое представление
                                 value = cell.toString().trim();
                         }
                     }
@@ -253,55 +247,47 @@ public class ExcelToNaumenUploader {
                     rowData.put(key, value);
                 }
 
-                // Вариант 1. На сервере ждут ОДИН объект:
-                String json = GSON.toJson(rowData);
-
-                // Вариант 2. Если на стороне Naumen ждут МАССИВ (даже из одной строки),
-                // то можно вместо строки выше использовать такую:
-                //
-                // String json = GSON.toJson(java.util.List.of(rowData));
-                //
-                // Тогда на Groovy будет List, а не Map.
-
-                jsonList.add(json);
+                rows.add(rowData);
             }
         }
 
-        return jsonList;
+        return rows;
     }
 
-    // ===================== ОТПРАВКА В NAUMEN ===========================
+    // ===================== HTTP POST JSON ==============================
+
+    /** Результат HTTP-запроса: код + тело. */
+    private static class HttpResult {
+        final int code;
+        final String body;
+
+        HttpResult(int code, String body) {
+            this.code = code;
+            this.body = body;
+        }
+
+        @Override
+        public String toString() {
+            return "HTTP " + code + ". Тело: " + body;
+        }
+    }
 
     /**
-     * Отправляет JSON-строку на указанный URL методом POST.
-     * Тело запроса — форма: "params=<URL-кодированный JSON>".
-     *
-     * На стороне Naumen:
-     *   def params = request.getParameter("params")
-     *   def obj = new JsonSlurper().parseText(params)
+     * Отправляет JSON в теле POST-запроса.
+     * Content-Type: application/json; charset=UTF-8.
+     * JSON попадает в аргумент requestContent у groovy-метода.
      */
-    private static String sendJsonRequest(String urlStr, String json) throws IOException {
-        // Готовим тело формы: params=<urlencoded json>
-        String encodedJson = URLEncoder.encode(json, StandardCharsets.UTF_8.toString());
-        String formBody = "params=" + encodedJson;
-
+    private static HttpResult postJsonBody(String urlStr, String jsonBody) throws IOException {
         URL url = new URL(urlStr);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
 
-        // Используем только POST (GET для exec-post не поддерживается)
         conn.setRequestMethod("POST");
-
-        // Формат тела — application/x-www-form-urlencoded с указанием UTF-8
-        conn.setRequestProperty(
-                "Content-Type",
-                "application/x-www-form-urlencoded; charset=UTF-8"
-        );
-
+        conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
         conn.setDoOutput(true);
 
-        // Записываем тело запроса
+        // пишем JSON в тело запроса
         try (OutputStream os = conn.getOutputStream()) {
-            byte[] bytes = formBody.getBytes(StandardCharsets.UTF_8);
+            byte[] bytes = jsonBody.getBytes(StandardCharsets.UTF_8);
             os.write(bytes);
             os.flush();
         }
@@ -318,10 +304,30 @@ public class ExcelToNaumenUploader {
         }
 
         conn.disconnect();
+        return new HttpResult(code, responseBody);
+    }
 
-        if (code == 500) {
-            return "HTTP 500 Internal Server Error. Тело ответа: " + responseBody;
+    // ===================== ЛОГИРОВАНИЕ ПРОБЛЕМНЫХ СТРОК ==================
+
+    /**
+     * Если сервер вернул 500, сохраняем JSON и ответ в файл failed_rows.log.
+     * Это удобно показать разработчикам Naumen.
+     */
+    private static void logFailedRow(int excelRowNum, String json, String responseBody) {
+        File logFile = new File("failed_rows.log");
+        try (FileWriter fw = new FileWriter(logFile, true);
+             BufferedWriter bw = new BufferedWriter(fw);
+             PrintWriter out = new PrintWriter(bw)) {
+
+            out.println("==== Excel row " + excelRowNum + " ====");
+            out.println("JSON отправленный (requestContent):");
+            out.println(json);
+            out.println("Ответ сервера (500):");
+            out.println(responseBody);
+            out.println();
+
+        } catch (IOException e) {
+            System.err.println("Не удалось записать failed_rows.log: " + e.getMessage());
         }
-        return "HTTP " + code + ". Тело ответа: " + responseBody;
     }
 }
