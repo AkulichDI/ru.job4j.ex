@@ -1,3 +1,7 @@
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
@@ -7,12 +11,14 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
 import java.util.stream.Collectors;
 
 public class SimpleJsonPoster {
 
     private static final String BASE_URL =
-            "http://HOST:8080/sd/services/rest/exec-post";
+            "https://HOST:8080/sd/services/rest/exec-post";
 
     private static final String ACCESS_KEY = "CHANGE_ME_ACCESS_KEY";
 
@@ -28,6 +34,8 @@ public class SimpleJsonPoster {
 
     public static void main(String[] args) {
         try {
+            trustAllSsl();
+
             String url = buildExecPostUrl();
             System.out.println("URL: " + url);
             System.out.println("JSON:");
@@ -88,5 +96,18 @@ public class SimpleJsonPoster {
 
         return "HTTP " + code + "\n" + responseBody;
     }
+
+    private static void trustAllSsl() throws Exception {
+        TrustManager[] trustAll = new TrustManager[]{
+                new X509TrustManager() {
+                    public void checkClientTrusted(X509Certificate[] xcs, String s) {}
+                    public void checkServerTrusted(X509Certificate[] xcs, String s) {}
+                    public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+                }
+        };
+        SSLContext sc = SSLContext.getInstance("TLS");
+        sc.init(null, trustAll, new SecureRandom());
+        HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
+        HttpsURLConnection.setDefaultHostnameVerifier((h, s) -> true);
+    }
 }
-```0
