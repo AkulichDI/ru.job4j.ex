@@ -22,14 +22,15 @@ public class SimpleJsonPoster {
 
     private static final String ACCESS_KEY = "CHANGE_ME_ACCESS_KEY";
 
-    private static final String FUNC_NAME = "modules.customApi.migration";
+    private static final String FUNC_NAME = "modules.customApi.addServCallApi1";
 
     private static final String JSON_TEXT = "{\n" +
-            "  \"field1\": \"value1\",\n" +
-            "  \"field2\": 123,\n" +
-            "  \"nested\": {\n" +
-            "    \"inner\": true\n" +
-            "  }\n" +
+            "  \"servicecall\": \"SC-0001\",\n" +
+            "  \"service\": \"Service A\",\n" +
+            "  \"infoservisiy\": \"Info text\",\n" +
+            "  \"servULag\": \"Lag-01\",\n" +
+            "  \"agreement\": \"AGR-001\",\n" +
+            "  \"description\": \"Test description\"\n" +
             "}";
 
     public static void main(String[] args) {
@@ -38,10 +39,10 @@ public class SimpleJsonPoster {
 
             String url = buildExecPostUrl();
             System.out.println("URL: " + url);
-            System.out.println("JSON:");
+            System.out.println("JSON_TEXT:");
             System.out.println(JSON_TEXT);
 
-            String response = sendJsonAsParams(url, JSON_TEXT);
+            String response = sendJsonBody(url, JSON_TEXT);
             System.out.println("Response:");
             System.out.println(response);
         } catch (Exception e) {
@@ -56,27 +57,25 @@ public class SimpleJsonPoster {
 
         sb.append(join)
           .append("accessKey=").append(URLEncoder.encode(ACCESS_KEY, StandardCharsets.UTF_8.toString()))
-          .append("&func=").append(URLEncoder.encode(FUNC_NAME, StandardCharsets.UTF_8.toString()));
+          .append("&func=").append(URLEncoder.encode(FUNC_NAME, StandardCharsets.UTF_8.toString()))
+          .append("&params=").append(URLEncoder.encode("requestContent", StandardCharsets.UTF_8.toString()));
 
         return sb.toString();
     }
 
-    private static String sendJsonAsParams(String urlStr, String jsonText) throws IOException {
-        String encodedJson = URLEncoder.encode(jsonText, StandardCharsets.UTF_8.toString());
-        String formBody = "params=" + encodedJson;
-
+    private static String sendJsonBody(String urlStr, String jsonText) throws IOException {
         URL url = new URL(urlStr);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
 
         conn.setRequestMethod("POST");
         conn.setRequestProperty(
                 "Content-Type",
-                "application/x-www-form-urlencoded; charset=UTF-8"
+                "application/json; charset=UTF-8"
         );
         conn.setDoOutput(true);
 
         try (OutputStream os = conn.getOutputStream()) {
-            byte[] bytes = formBody.getBytes(StandardCharsets.UTF_8);
+            byte[] bytes = jsonText.getBytes(StandardCharsets.UTF_8);
             os.write(bytes);
             os.flush();
         }
